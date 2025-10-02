@@ -14,16 +14,20 @@ st.set_page_config(page_title="Reserves Tie-Out Checker", layout="wide")
 st.title("📊 Reserves Tie-Out Checker")
 st.caption(
     "Schaper-format parser: Table 1.1, Cash-Flow pages (detected by header), and One-line Summary totals. "
-    "Now also ties out Oil, Gas, and NGL separately."
+    "Now ties out Oil, Gas, NGL, BOE, and PV10 across sections."
 )
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
     st.header("Options")
-    abs_tol = st.number_input("Absolute tolerance", min_value=0.0, value=0.5, step=0.1,
-                              help="Allowed absolute difference (units: Oil/NGL in Mbbl, Gas in MMcf, BOE in Mboe, PV in $MM).")
-    rel_tol_pct = st.number_input("Relative tolerance (%)", min_value=0.0, value=0.1, step=0.05,
-                                  help="Allowed percent difference across sources.")
+    abs_tol = st.number_input(
+        "Absolute tolerance", min_value=0.0, value=0.5, step=0.1,
+        help="Allowed absolute difference (units: Oil/NGL in Mbbl, Gas in MMcf, BOE in Mboe, PV in $MM)."
+    )
+    rel_tol_pct = st.number_input(
+        "Relative tolerance (%)", min_value=0.0, value=0.1, step=0.05,
+        help="Allowed percent difference across sources."
+    )
     strict = st.checkbox("Strict: every source must have every field", value=False)
     case_name = st.text_input("Case/Project name", "")
 
@@ -60,11 +64,10 @@ TABLE11_ROW_PAT = re.compile(
     r"([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+\$\s*([0-9,]+)\s+\$\s*([0-9,]+)"
 )
 
-# Cash-flow TOTAL line: capture the last two numeric tokens (Undisc, PV10) to be robust to spacing
-TOTAL_LINE_PAT = re.compile(r"(?mi)^\s*TOTAL\b[^\n]*?(-?\d[\d,]*\.?\d*)\s+(-?\d[\d,]*\.?\d*)\s*$")
+# Cash-flow TOTAL line: we’ll slice numeric columns by header positions; still capture the last two numeric tokens as (Undisc, PV10)
+TOTAL_LINE_LAST_TWO = re.compile(r"(?mi)^\s*TOTAL\b[^\n]*?(-?\d[\d,]*\.?\d*)\s+(-?\d[\d,]*\.?\d*)\s*$")
 
 # One-line Summary TOTAL rows: Oil, Gas, NGL, BOE, PV10($); convert PV10 to $MM
-# (The order on one-line is typically OIL, GAS, NGL, NET BOE, PV10-$)
 ONELINE_TOTAL_PAT = re.compile(
     r"(?im)^\s*TOTAL\s+(1PDP|4PUD|5PROB|6POSS)\s+([0-9\.,]+)\s+([0-9\.,]+)\s+([0-9\.,]+)\s+([0-9\.,]+)\s+([0-9,]+)\s*$"
 )
@@ -77,15 +80,73 @@ METRICS = [
     "PV10 ($MM)",
 ]
 
+def _slice_last_number(text_segment: str):
+    m = re.findall(r"-?\d[\d,]*\.?\d*", text_segment)
+    return _to_f(m[-1]) if m else math.nan
+
+def _extract_cashflow_totals_by_columns(lines):
+    """
+    From a cash-flow page, find the header line (with NET OIL/GAS/NGL/EQUIV),
+    detect start indices for those columns, then read the last TOTAL row and slice the numbers.
+    Returns dict with Oil (Mbbl), Gas (MMcf), NGL (Mbbl), Net BOE (Mboe).
+    """
+    header_idx = None
+    header_line = ""
+    for i, ln in enumerate(lines):
+        if ("NET OIL" in ln and "NET GAS" in ln and "NET NGL" in ln and "NET EQUIV" in ln):
+            header_idx = i
+            header_line = ln
+            break
+    if header_idx is None:
+        return {}
+
+    # Column start indices (robust to variable spacing/monospace layout)
+    pos_oil = header_line.find("NET OIL")
+    pos_gas = header_line.find("NET GAS")
+    pos_ngl = header_line.find("NET NGL")
+    pos_boe = header_line.find("NET EQUIV")
+    if min(pos_oil, pos_gas, pos_ngl, pos_boe) < 0:
+        return {}
+
+    # Find the last TOTAL line on this page
+    total_idx = None
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("TOTAL"):
+            total_idx = i  # keep last
+    if total_idx is None:
+        return {}
+
+    total_line = lines[total_idx]
+
+    # Slice segments based on header starts
+    seg_oil = total_line[pos_oil:pos_gas]
+    seg_gas = total_line[pos_gas:pos_ngl]
+    seg_ngl = total_line[pos_ngl:pos_boe]
+    seg_boe = total_line[pos_boe:]  # until end
+
+    oil = _slice_last_number(seg_oil)
+    gas = _slice_last_number(seg_gas)
+    ngl = _slice_last_number(seg_ngl)
+    boe = _slice_last_number(seg_boe)
+
+    return {
+        "Oil (Mbbl)": oil,
+        "Gas (MMcf)": gas,
+        "NGL (Mbbl)": ngl,
+        "Net BOE (Mboe)": boe,
+    }
+
 def parse_pdf_schaper(file_obj):
     """Parse a Schaper-format reserves PDF into rows of [Source, Category, metrics...]."""
     if not HAS_PDFPLUMBER:
         return None, "pdfplumber is not installed"
+
     rows = []
     try:
         with pdfplumber.open(file_obj) as pdf:
             for page in pdf.pages:
                 text = page.extract_text() or ""
+                lines = text.splitlines()
 
                 # ---- Table 1.1 matches on any page ----
                 for m in TABLE11_ROW_PAT.finditer(text):
@@ -121,27 +182,31 @@ def parse_pdf_schaper(file_obj):
                             }
                         )
 
-                # ---- Cash-flow page: detect category from header, then read last TOTAL line (PV10 only) ----
+                # ---- Cash-flow page: detect category in header ----
                 mcat = RSV_CAT_PAT.search(text)
                 if mcat:
                     cat = mcat.group(1)
-                    last_tot = None
-                    for m in TOTAL_LINE_PAT.finditer(text):
-                        last_tot = m  # keep the last TOTAL occurrence on the page
-                    if last_tot:
-                        undisc = _to_f(last_tot.group(1))
-                        pv10 = _to_f(last_tot.group(2))
-                        rows.append(
-                            {
-                                "Source": "Cash Flows",
-                                "Category": cat,
-                                "Oil (Mbbl)": math.nan,
-                                "Gas (MMcf)": math.nan,
-                                "NGL (Mbbl)": math.nan,
-                                "Net BOE (Mboe)": math.nan,
-                                "PV10 ($MM)": pv10,
-                            }
-                        )
+
+                    # Pull PV10 (last two numeric tokens on TOTAL line -> second is PV10)
+                    last_two = None
+                    for m in TOTAL_LINE_LAST_TWO.finditer(text):
+                        last_two = m  # keep last TOTAL on page
+                    pv10_cf = _to_f(last_two.group(2)) if last_two else math.nan
+
+                    # Pull Oil/Gas/NGL/BOE totals using header column positions
+                    col_totals = _extract_cashflow_totals_by_columns(lines)
+
+                    rows.append(
+                        {
+                            "Source": "Cash Flows",
+                            "Category": cat,
+                            "Oil (Mbbl)": col_totals.get("Oil (Mbbl)", math.nan),
+                            "Gas (MMcf)": col_totals.get("Gas (MMcf)", math.nan),
+                            "NGL (Mbbl)": col_totals.get("NGL (Mbbl)", math.nan),
+                            "Net BOE (Mboe)": col_totals.get("Net BOE (Mboe)", math.nan),
+                            "PV10 ($MM)": pv10_cf,
+                        }
+                    )
 
                 # ---- One-line Summary totals (OIL, GAS, NGL, NET BOE, PV10-$) ----
                 for m in ONELINE_TOTAL_PAT.finditer(text):
