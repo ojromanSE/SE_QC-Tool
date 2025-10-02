@@ -1,6 +1,4 @@
-
 import re
-import io
 import math
 import pandas as pd
 import streamlit as st
@@ -14,13 +12,16 @@ except Exception:
 
 st.set_page_config(page_title="Reserves Tie-Out Checker", layout="wide")
 st.title("📊 Reserves Tie-Out Checker")
-st.caption("Schaper-format parser: Table 1.1, Cash-Flow pages (detected by header), and One-line Summary totals.")
+st.caption(
+    "Schaper-format parser: Table 1.1, Cash-Flow pages (detected by header), and One-line Summary totals. "
+    "Now also ties out Oil, Gas, and NGL separately."
+)
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
     st.header("Options")
     abs_tol = st.number_input("Absolute tolerance", min_value=0.0, value=0.5, step=0.1,
-                              help="Allowed absolute difference (same units as metric; e.g., Mboe or $MM).")
+                              help="Allowed absolute difference (units: Oil/NGL in Mbbl, Gas in MMcf, BOE in Mboe, PV in $MM).")
     rel_tol_pct = st.number_input("Relative tolerance (%)", min_value=0.0, value=0.1, step=0.05,
                                   help="Allowed percent difference across sources.")
     strict = st.checkbox("Strict: every source must have every field", value=False)
@@ -53,7 +54,7 @@ def within_tolerance(vals, abs_tol, rel_tol_pct):
 # Cash-flow page: category is indicated in the header (top-left), like "SE_RSV_CAT = 1PDP"
 RSV_CAT_PAT = re.compile(r"(?i)SE[_\s]*RSV[_\s]*CAT\s*[:=]\s*(1PDP|4PUD|5PROB|6POSS)")
 
-# Table 1.1 rows: capture Net BOE and PV10 ($MM) for each category
+# Table 1.1 rows: capture Gas (MMcf), NGL (Mbbls), Oil (Mbbls), Equivalent (Mboe), Undisc ($MM), PV10 ($MM)
 TABLE11_ROW_PAT = re.compile(
     r"(?i)(Total\s+Proved\s+Reserves|Proved\s+Developed\s+Producing\s+\(1PDP\)|Proved\s+Undeveloped\s+\(4PUD\)|Total\s+Probable\s+Reserves\s+\(5PROB\)|Total\s+Possible\s+Reserves\s+\(6POSS\)).*?"
     r"([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+\$\s*([0-9,]+)\s+\$\s*([0-9,]+)"
@@ -62,13 +63,22 @@ TABLE11_ROW_PAT = re.compile(
 # Cash-flow TOTAL line: capture the last two numeric tokens (Undisc, PV10) to be robust to spacing
 TOTAL_LINE_PAT = re.compile(r"(?mi)^\s*TOTAL\b[^\n]*?(-?\d[\d,]*\.?\d*)\s+(-?\d[\d,]*\.?\d*)\s*$")
 
-# One-line Summary TOTAL rows (PV10 in dollars; convert to $MM). Often for 1PDP/4PUD/5PROB.
+# One-line Summary TOTAL rows: Oil, Gas, NGL, BOE, PV10($); convert PV10 to $MM
+# (The order on one-line is typically OIL, GAS, NGL, NET BOE, PV10-$)
 ONELINE_TOTAL_PAT = re.compile(
     r"(?im)^\s*TOTAL\s+(1PDP|4PUD|5PROB|6POSS)\s+([0-9\.,]+)\s+([0-9\.,]+)\s+([0-9\.,]+)\s+([0-9\.,]+)\s+([0-9,]+)\s*$"
 )
 
+METRICS = [
+    "Oil (Mbbl)",
+    "Gas (MMcf)",
+    "NGL (Mbbl)",
+    "Net BOE (Mboe)",
+    "PV10 ($MM)",
+]
+
 def parse_pdf_schaper(file_obj):
-    """Parse a Schaper-format reserves PDF into rows of [Source, Category, Net BOE (Mboe), PV10 ($MM)]."""
+    """Parse a Schaper-format reserves PDF into rows of [Source, Category, metrics...]."""
     if not HAS_PDFPLUMBER:
         return None, "pdfplumber is not installed"
     rows = []
@@ -80,7 +90,13 @@ def parse_pdf_schaper(file_obj):
                 # ---- Table 1.1 matches on any page ----
                 for m in TABLE11_ROW_PAT.finditer(text):
                     label = m.group(1)
-                    gas, ngl, oil, boe, undisc, pv10 = [_to_f(m.group(i)) for i in range(2, 8)]
+                    gas = _to_f(m.group(2))     # MMcf
+                    ngl = _to_f(m.group(3))     # Mbbl
+                    oil = _to_f(m.group(4))     # Mbbl
+                    boe = _to_f(m.group(5))     # Mboe
+                    undisc = _to_f(m.group(6))  # $MM (unused here)
+                    pv10 = _to_f(m.group(7))    # $MM
+
                     key = None
                     if "Developed" in label:
                         key = "1PDP"
@@ -94,10 +110,18 @@ def parse_pdf_schaper(file_obj):
                         key = "TOTAL PROVED"
                     if key:
                         rows.append(
-                            {"Source": "Table1.1", "Category": key, "Net BOE (Mboe)": boe, "PV10 ($MM)": pv10}
+                            {
+                                "Source": "Table1.1",
+                                "Category": key,
+                                "Oil (Mbbl)": oil,
+                                "Gas (MMcf)": gas,
+                                "NGL (Mbbl)": ngl,
+                                "Net BOE (Mboe)": boe,
+                                "PV10 ($MM)": pv10,
+                            }
                         )
 
-                # ---- Cash-flow page: detect category from header, then read last TOTAL line ----
+                # ---- Cash-flow page: detect category from header, then read last TOTAL line (PV10 only) ----
                 mcat = RSV_CAT_PAT.search(text)
                 if mcat:
                     cat = mcat.group(1)
@@ -108,16 +132,35 @@ def parse_pdf_schaper(file_obj):
                         undisc = _to_f(last_tot.group(1))
                         pv10 = _to_f(last_tot.group(2))
                         rows.append(
-                            {"Source": "Cash Flows", "Category": cat, "Net BOE (Mboe)": math.nan, "PV10 ($MM)": pv10}
+                            {
+                                "Source": "Cash Flows",
+                                "Category": cat,
+                                "Oil (Mbbl)": math.nan,
+                                "Gas (MMcf)": math.nan,
+                                "NGL (Mbbl)": math.nan,
+                                "Net BOE (Mboe)": math.nan,
+                                "PV10 ($MM)": pv10,
+                            }
                         )
 
-                # ---- One-line Summary totals ----
+                # ---- One-line Summary totals (OIL, GAS, NGL, NET BOE, PV10-$) ----
                 for m in ONELINE_TOTAL_PAT.finditer(text):
                     key = m.group(1)
+                    oil = _to_f(m.group(2))
+                    gas = _to_f(m.group(3))
+                    ngl = _to_f(m.group(4))
                     boe = _to_f(m.group(5))
                     pv10_dollars = _to_f(m.group(6))
                     rows.append(
-                        {"Source": "One-line", "Category": key, "Net BOE (Mboe)": boe, "PV10 ($MM)": pv10_dollars / 1000.0}
+                        {
+                            "Source": "One-line",
+                            "Category": key,
+                            "Oil (Mbbl)": oil,
+                            "Gas (MMcf)": gas,
+                            "NGL (Mbbl)": ngl,
+                            "Net BOE (Mboe)": boe,
+                            "PV10 ($MM)": pv10_dollars / 1000.0,
+                        }
                     )
 
     except Exception as e:
@@ -131,7 +174,7 @@ def check_consistency(df):
     """For each Category × Metric, check if sources tie within tolerance."""
     out = []
     for cat in sorted(df["Category"].unique()):
-        for metric in ["Net BOE (Mboe)", "PV10 ($MM)"]:
+        for metric in METRICS:
             vals = df.loc[df["Category"] == cat, metric].dropna().tolist()
             if strict and len(vals) < df["Source"].nunique():
                 ok = False
