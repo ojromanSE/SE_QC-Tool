@@ -260,6 +260,9 @@ def check_consistency(df):
                 ok = False
             else:
                 ok = within_tolerance(vals, abs_tol, rel_tol_pct) if vals else False
+
+            status = "✅" if ok else "❌"   # green check / red cross
+
             out.append(
                 {
                     "Category": cat,
@@ -267,10 +270,11 @@ def check_consistency(df):
                     "Sources": int(df.loc[(df["Category"] == cat) & df[metric].notna()].shape[0]),
                     "Min": pd.Series(vals).min() if vals else math.nan,
                     "Max": pd.Series(vals).max() if vals else math.nan,
-                    "Consistent?": bool(ok),
+                    "Consistent?": status,
                 }
             )
     return pd.DataFrame(out)
+
 
 # ---------------- UI ----------------
 pdf_files = st.file_uploader("Upload Reserves PDF(s)", type=["pdf"], accept_multiple_files=True)
