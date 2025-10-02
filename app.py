@@ -14,8 +14,8 @@ except Exception:
 st.set_page_config(page_title="Reserves Tie-Out Checker", layout="wide")
 st.title("📊 Reserves Tie-Out Checker")
 st.caption(
-    "Schaper-format parser with cross-checks across PDF (Table 1.1 / Cash Flows / One-line) "
-    "and two Excel files (Oneline + Monthly by SE_RSV_CAT). Green ✅ / Red ❌ indicate consistency."
+    "Cross-check PDF (Table 1.1 / Cash Flows / One-line) vs. Excel (Oneline + Monthly by SE_RSV_CAT). "
+    "Green ✅ / Red ❌ indicate consistency."
 )
 
 # ---------------- Sidebar ----------------
@@ -61,18 +61,6 @@ def _norm_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
-
-def _find_col(df: pd.DataFrame, patterns) -> str | None:
-    """Return first column whose name matches any regex in patterns (case-insensitive)."""
-    for pat in patterns:
-        cre = re.compile(pat, re.I)
-        for c in df.columns:
-            if cre.search(str(c)):
-                return c
-    return None
-
-def _sum_numeric(series: pd.Series) -> float:
-    return pd.to_numeric(series, errors="coerce").sum(skipna=True)
 
 # ---------------- Regex patterns (PDF text) ----------------
 RSV_CAT_PAT = re.compile(r"(?i)SE[_\s]*RSV[_\s]*CAT\s*[:=]\s*(1PDP|4PUD|5PROB|6POSS)")
@@ -137,7 +125,7 @@ def _extract_cashflow_totals_from_page(page) -> dict:
     x_oil = find_header_x("NET OIL PROD")
     x_gas = find_header_x("NET GAS PROD")
     x_ngl = find_header_x("NET NGL PROD")
-    x_boe = find_header_x("NET EQUIV")  # optional
+    x_boe = find_header_x("NET EQUIV")  # optional (only if present)
 
     numeric_on_total = [
         w for w in words if abs(w["top"] - tot_y) < 3 and NUM_RE.match(w["text"].strip())
@@ -248,113 +236,137 @@ def parse_pdf_schaper(file_obj):
         return None, "No recognizable sections found."
     return pd.DataFrame(rows), None
 
-# ---------------- Excel: Oneline parser ----------------
+# ---------------- Excel: Oneline parser (exact columns) ----------------
 def parse_oneline_xlsx(file):
     """
-    Expect a column like SE_RSV_CAT (reserve category).
-    Detect Oil/Gas/NGL/BOE/PV columns flexibly. Totals by Category.
+    Parse Oneline XLS with explicit columns:
+    SE_RSV_CAT, Net Res Oil (Mbbl), Net Res Gas (MMcf), Net Res NGL (Mbbl),
+    Net Res (MBOE), NPV at 10%.
+    Group by SE_RSV_CAT and sum volumes/NPV.
     """
-    xls = pd.ExcelFile(file)
+    df = pd.read_excel(file)
+    df = _norm_columns(df)
+
+    required_cols = [
+        "SE_RSV_CAT",
+        "Net Res Oil (Mbbl)",
+        "Net Res Gas (MMcf)",
+        "Net Res NGL (Mbbl)",
+        "Net Res (MBOE)",
+        "NPV at 10%",
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        st.error(f"Oneline XLS missing expected columns: {missing}")
+        return pd.DataFrame(columns=["Source","Category"]+METRICS)
+
+    # Clean numeric columns
+    for c in required_cols[1:]:
+        df[c] = pd.to_numeric(df[c].replace("[\\$,]", "", regex=True), errors="coerce")
+
+    grouped = df.groupby("SE_RSV_CAT").agg({
+        "Net Res Oil (Mbbl)": "sum",
+        "Net Res Gas (MMcf)": "sum",
+        "Net Res NGL (Mbbl)": "sum",
+        "Net Res (MBOE)": "sum",
+        "NPV at 10%": "sum",
+    }).reset_index()
+
+    # Normalize PV10 to $MM
+    grouped["PV10 ($MM)"] = grouped["NPV at 10%"] / 1_000_000.0
+
     frames = []
-    for sheet in xls.sheet_names:
-        df = xls.parse(sheet)
-        if df.empty:
-            continue
-        df = _norm_columns(df)
+    for _, r in grouped.iterrows():
+        frames.append({
+            "Source": "Oneline XLS",
+            "Category": str(r["SE_RSV_CAT"]).strip(),
+            "Oil (Mbbl)": r["Net Res Oil (Mbbl)"],
+            "Gas (MMcf)": r["Net Res Gas (MMcf)"],
+            "NGL (Mbbl)": r["Net Res NGL (Mbbl)"],
+            "Net BOE (Mboe)": r["Net Res (MBOE)"],
+            "PV10 ($MM)": r["PV10 ($MM)"],
+        })
+    return pd.DataFrame(frames)
 
-        cat_col = _find_col(df, [r"\bSE[_\s-]*RSV[_\s-]*CAT\b", r"\bRESERVE\s*CAT", r"\bCATEGORY\b"])
-        if not cat_col:
-            continue
-
-        oil_col = _find_col(df, [r"\bNET\s*OIL\b", r"\bOIL\b"])
-        gas_col = _find_col(df, [r"\bNET\s*GAS\b", r"\bGAS\b"])
-        ngl_col = _find_col(df, [r"\bNET\s*NGL\b", r"\bNGL\b"])
-        boe_col = _find_col(df, [r"\bNET\s*BOE\b", r"\bEQUIV\b"])
-        pv_col  = _find_col(df, [r"\bPV\s*10\b", r"\bPRESENT\s*VALUE", r"\bPV\b"])
-
-        num_cols = [c for c in [oil_col, gas_col, ngl_col, boe_col, pv_col] if c]
-        if not num_cols:
-            continue
-
-        slim = df[num_cols].apply(pd.to_numeric, errors="coerce")
-        key = df[cat_col].astype(str).str.strip()
-        grouped = slim.groupby(key).agg(_sum_numeric)
-        grouped.index.name = "Category"
-        grouped = grouped.reset_index()
-
-        # Normalize PV to $MM if values look like dollars
-        if pv_col and pv_col in grouped:
-            pv_series = pd.to_numeric(grouped[pv_col], errors="coerce")
-            if pv_series.max(skipna=True) and pv_series.max(skipna=True) > 1_000_000:
-                grouped["PV10 ($MM)"] = pv_series / 1_000_000.0
-            else:
-                grouped["PV10 ($MM)"] = pv_series
-
-        rename_map = {}
-        if oil_col: rename_map[oil_col] = "Oil (Mbbl)"
-        if gas_col: rename_map[gas_col] = "Gas (MMcf)"
-        if ngl_col: rename_map[ngl_col] = "NGL (Mbbl)"
-        if boe_col: rename_map[boe_col] = "Net BOE (Mboe)"
-        grouped = grouped.rename(columns=rename_map, errors="ignore")
-
-        keep_cols = ["Category", "Oil (Mbbl)", "Gas (MMcf)", "NGL (Mbbl)", "Net BOE (Mboe)", "PV10 ($MM)"]
-        grouped = grouped.reindex(columns=keep_cols)
-        for _, r in grouped.iterrows():
-            frames.append({"Source": "Oneline XLS", **{k: r.get(k, math.nan) for k in keep_cols}})
-
-    cols = ["Source", "Category"] + METRICS
-    return pd.DataFrame(frames, columns=cols) if frames else pd.DataFrame(columns=cols)
-
-# ---------------- Excel: Monthly parser ----------------
+# ---------------- Excel: Monthly parser (tight headers) ----------------
 def parse_monthly_xlsx(file):
     """
-    Expect rows with SE_RSV_CAT and columns: 'NET OIL PROD', 'NET GAS PROD', 'NET NGL PROD'.
-    Sum by Category. PV10 not expected here.
+    Expect rows with:
+      SE_RSV_CAT, Net Oil Prod, Net Gas Prod, Net NGL Prod
+    (case-insensitive). We sum by category. PV10 not expected here.
     """
-    xls = pd.ExcelFile(file)
+    # Read all sheets into a dict
+    x = pd.read_excel(file, sheet_name=None)
     frames = []
-    for sheet in xls.sheet_names:
-        df = xls.parse(sheet)
-        if df.empty:
+
+    for sheet_name, df in x.items():
+        if df is None or df.empty:
             continue
         df = _norm_columns(df)
 
-        cat_col = _find_col(df, [r"\bSE[_\s-]*RSV[_\s-]*CAT\b", r"\bRESERVE\s*CAT", r"\bCATEGORY\b"])
-        if not cat_col:
+        # Case-insensitive exact names
+        cols_lower = {c.lower(): c for c in df.columns}
+        def get_col(name_ci):
+            return cols_lower.get(name_ci.lower())
+
+        cat_col = get_col("SE_RSV_CAT") or get_col("se_rsv_cat")
+        oil_col = get_col("Net Oil Prod")
+        gas_col = get_col("Net Gas Prod")
+        ngl_col = get_col("Net NGL Prod")
+        boe_col = get_col("Net BOE") or get_col("Net Equiv")  # optional
+
+        if not cat_col or not (oil_col and gas_col and ngl_col):
+            # Try flexible match if exact not found
+            def find_like(pat):
+                r = re.compile(pat, re.I)
+                for c in df.columns:
+                    if r.fullmatch(str(c).strip()):
+                        return c
+                for c in df.columns:
+                    if r.search(str(c)):
+                        return c
+                return None
+            cat_col = cat_col or find_like(r"SE[_\s-]*RSV[_\s-]*CAT")
+            oil_col = oil_col or find_like(r"Net\s*Oil\s*Prod")
+            gas_col = gas_col or find_like(r"Net\s*Gas\s*Prod")
+            ngl_col = ngl_col or find_like(r"Net\s*NGL\s*Prod")
+            boe_col = boe_col or find_like(r"Net\s*(BOE|Equiv)")
+
+        if not cat_col or not (oil_col and gas_col and ngl_col):
+            # not a sheet we care about
             continue
 
-        oil_col = _find_col(df, [r"\bNET\s*OIL\s*PROD\b"])
-        gas_col = _find_col(df, [r"\bNET\s*GAS\s*PROD\b"])
-        ngl_col = _find_col(df, [r"\bNET\s*NGL\s*PROD\b"])
-        boe_col = _find_col(df, [r"\bNET\s*(BOE|EQUIV)\b"])  # optional
+        # Coerce numeric
+        for c in [oil_col, gas_col, ngl_col, boe_col]:
+            if c in df:
+                df[c] = pd.to_numeric(df[c].replace("[\\$,]", "", regex=True), errors="coerce")
 
-        num_cols = [c for c in [oil_col, gas_col, ngl_col, boe_col] if c]
-        if not num_cols:
-            continue
-
-        slim = df[num_cols].apply(pd.to_numeric, errors="coerce")
         key = df[cat_col].astype(str).str.strip()
-        grouped = slim.groupby(key).agg(_sum_numeric)
+        slim_cols = [c for c in [oil_col, gas_col, ngl_col, boe_col] if c]
+        grouped = df[slim_cols].groupby(key).agg(_sum_numeric)
         grouped.index.name = "Category"
         grouped = grouped.reset_index()
 
-        rename_map = {}
-        if oil_col: rename_map[oil_col] = "Oil (Mbbl)"
-        if gas_col: rename_map[gas_col] = "Gas (MMcf)"
-        if ngl_col: rename_map[ngl_col] = "NGL (Mbbl)"
-        if boe_col: rename_map[boe_col] = "Net BOE (Mboe)"
-        grouped = grouped.rename(columns=rename_map, errors="ignore")
+        rename = {}
+        rename[oil_col] = "Oil (Mbbl)"
+        rename[gas_col] = "Gas (MMcf)"
+        rename[ngl_col] = "NGL (Mbbl)"
+        if boe_col: rename[boe_col] = "Net BOE (Mboe)"
+        grouped = grouped.rename(columns=rename)
 
         keep_cols = ["Category", "Oil (Mbbl)", "Gas (MMcf)", "NGL (Mbbl)", "Net BOE (Mboe)"]
         grouped = grouped.reindex(columns=keep_cols)
+
         for _, r in grouped.iterrows():
-            frames.append(
-                {
-                    "Source": "Monthly XLS",
-                    **{k: r.get(k, math.nan) for k in keep_cols},
-                    "PV10 ($MM)": math.nan,
-                }
-            )
+            frames.append({
+                "Source": "Monthly XLS",
+                "Category": r.get("Category"),
+                "Oil (Mbbl)": r.get("Oil (Mbbl)", math.nan),
+                "Gas (MMcf)": r.get("Gas (MMcf)", math.nan),
+                "NGL (Mbbl)": r.get("NGL (Mbbl)", math.nan),
+                "Net BOE (Mboe)": r.get("Net BOE (Mboe)", math.nan),
+                "PV10 ($MM)": math.nan,
+            })
 
     cols = ["Source", "Category"] + METRICS
     return pd.DataFrame(frames, columns=cols) if frames else pd.DataFrame(columns=cols)
@@ -387,9 +399,9 @@ left, right = st.columns(2)
 with left:
     pdf_files = st.file_uploader("Upload **PDF** report(s)", type=["pdf"], accept_multiple_files=True)
 with right:
-    oneline_xls = st.file_uploader("Upload **Oneline XLS(X)**", type=["xls", "xlsx"], accept_multiple_files=False)
+    oneline_xls = st.file_uploader("Upload **Oneline XLSX**", type=["xls", "xlsx"], accept_multiple_files=False)
 
-monthly_xls = st.file_uploader("Upload **Monthly XLS(X)**", type=["xls", "xlsx"], accept_multiple_files=False, key="monthly")
+monthly_xls = st.file_uploader("Upload **Monthly XLSX**", type=["xls", "xlsx"], accept_multiple_files=False, key="monthly")
 
 frames = []
 
@@ -413,7 +425,7 @@ if oneline_xls:
                 df.insert(0, "File", getattr(oneline_xls, "name", "Oneline.xlsx"))
                 frames.append(df)
             else:
-                st.warning("Oneline XLS: no recognizable sheets/columns found.")
+                st.warning("Oneline XLS: no recognizable columns found.")
         except Exception as e:
             st.error(f"Oneline XLS parse error: {e}")
 
@@ -426,10 +438,11 @@ if monthly_xls:
                 df.insert(0, "File", getattr(monthly_xls, "name", "Monthly.xlsx"))
                 frames.append(df)
             else:
-                st.warning("Monthly XLS: no recognizable sheets/columns found.")
+                st.warning("Monthly XLS: no recognizable columns found.")
         except Exception as e:
             st.error(f"Monthly XLS parse error: {e}")
 
+# ---------------- Output ----------------
 if frames:
     merged = pd.concat(frames, ignore_index=True)
 
