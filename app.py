@@ -83,17 +83,16 @@ TABLE11_ROW_PAT = re.compile(
 # Cash flow page category tag in the top-left
 RSV_CAT_PAT = re.compile(r"(?i)SE[_\s]*RSV[_\s]*CAT\s*=\s*(1PDP|3PDNP|4PUD|5PROB|6POSS)")
 
-# Oneline totals (grey rows) for each category
+# Oneline (PDF) category totals and grand total
 ONELINE_CAT_TOTAL_PAT = re.compile(
     r"(?im)^\s*(1PDP|3PDNP|4PUD|5PROB|6POSS)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,][0-9,]*)\s+([0-9,][0-9,]*)\s*$"
 )
-# Oneline grand total row
 ONELINE_GRAND_TOTAL_PAT = re.compile(
     r"(?im)^\s*Grand\s+Total\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,][0-9,]*)\s+([0-9,][0-9,]*)\s*$"
 )
 
-# TOTAL line (fallback for PV if needed)
-TOTAL_LAST_TWO = re.compile(r"(?mi)^\s*TOTAL\b[^\n]*?(-?\d[\d,]*\.?\d*)\s+(-?\d[\d,]*\.?\d*)\s*$")
+# PV10 on each CF page (bottom right box)
+PV_BOX_PAT = re.compile(r"(?i)P\.W\.,\s*M\$\s*([0-9][\d,\.\s]*)")
 
 # ---------- Cash‑flow helpers ----------
 def _nearest_by_x(target_x, numeric_words):
@@ -107,9 +106,9 @@ def _nearest_by_x(target_x, numeric_words):
 
 def _extract_cashflow_totals_from_page(page) -> dict:
     """
-    Align TOTAL row numbers to column headers for:
-      NET OIL PROD, NET GAS PROD, NET NGL PROD (and optionally NET EQUIV).
-    Also tries to pick PV10 (M$) from the CUM. DISC. FCF/CM. DISC. FCF column family when possible.
+    Robustly extract from CF page:
+      • Net Oil/Gas/NGL totals from the *volumes* TOTAL row (upper table)
+      • PV10 (M$) from the P.W., M$ box (bottom)
     """
     words = page.extract_words(
         use_text_flow=True, keep_blank_chars=False, extra_attrs=["x0", "x1", "top", "bottom"]
@@ -117,69 +116,84 @@ def _extract_cashflow_totals_from_page(page) -> dict:
     if not words:
         return {}
 
-    # Locate the TOTAL row (last "TOTAL" on the page)
-    total_words = [w for w in words if w["text"].strip().upper() == "TOTAL"]
-    if not total_words:
+    # Build lines to detect the economics header (CUM. DISC. FCF)
+    by_line = {}
+    for w in words:
+        y = round(w["top"], 1)
+        by_line.setdefault(y, []).append(w)
+    lines = []
+    for y, ws in by_line.items():
+        ws_sorted = sorted(ws, key=lambda t: t["x0"])
+        text = " ".join([t["text"] for t in ws_sorted]).upper()
+        lines.append((y, ws_sorted, text))
+    lines.sort(key=lambda t: t[0])
+
+    econ_hdr_y = None
+    for y, _, txt in lines:
+        if "CUM" in txt and "DISC" in txt and "FCF" in txt:
+            econ_hdr_y = y
+            break
+
+    # TOTAL candidates
+    total_ws = [w for w in words if w["text"].strip().upper() == "TOTAL"]
+    if not total_ws:
         return {}
-    tot_word = max(total_words, key=lambda w: w["top"])
-    tot_y = tot_word["top"]
 
-    # Headers above TOTAL
-    headers = [w for w in words if w["top"] < tot_y - 5]
+    # Volumes TOTAL: last TOTAL before the economics header
+    vol_tot_y = None
+    if econ_hdr_y is not None:
+        before = [w for w in total_ws if w["top"] < econ_hdr_y - 1]
+        if before:
+            vol_tot_y = max(before, key=lambda w: w["top"])["top"]
+    if vol_tot_y is None:
+        # Fallback: the first TOTAL on the page is usually the volumes TOTAL
+        vol_tot_y = min(total_ws, key=lambda w: w["top"])["top"]
 
-    def find_header_x(candidates):
-        for cand in candidates:
-            lbl = cand.upper()
-            matches = [w for w in headers if w["text"].strip().upper() == lbl]
-            if matches:
-                h = min(matches, key=lambda w: w["top"])
-                return (h["x0"] + h["x1"]) / 2.0
+    # Header centers for NET OIL / NET GAS / NET NGL (no longer require 'PROD')
+    header_candidates = [w for w in words if w["top"] < vol_tot_y - 5]
+    header_candidates.sort(key=lambda w: (w["top"], w["x0"]))
+
+    def center_for_pair(second_token):
+        for i in range(len(header_candidates) - 1):
+            a = header_candidates[i]["text"].strip().upper()
+            b = header_candidates[i + 1]["text"].strip().upper()
+            if a == "NET" and b == second_token:
+                x0 = min(header_candidates[i]["x0"], header_candidates[i + 1]["x0"])
+                x1 = max(header_candidates[i]["x1"], header_candidates[i + 1]["x1"])
+                return (x0 + x1) / 2.0
         return None
 
-    x_oil = find_header_x(["NET OIL PROD", "NET OIL"])
-    x_gas = find_header_x(["NET GAS PROD", "NET GAS"])
-    x_ngl = find_header_x(["NET NGL PROD", "NET NGL"])
-    x_boe = find_header_x(["NET EQUIV", "NET EQUI"])  # optional
+    x_oil = center_for_pair("OIL")
+    x_gas = center_for_pair("GAS")
+    x_ngl = center_for_pair("NGL")
 
-    # PV: try the column family "CUM. DISC. FCF"/"CM. DISC. FCF"
-    x_pv = find_header_x([
-        "CUM. DISC. FCF", "CUM. DISC. FCF.", "CM. DISC. FCF", "CUM DISC FCF",
-        "CUM. DISC.", "DISC. FCF"
-    ])
-
-    numeric_on_total = [
-        w for w in words if abs(w["top"] - tot_y) < 3 and NUM_RE.match(w["text"].strip())
+    # Numbers on the volumes TOTAL line
+    nums_on_vol_total = [
+        w for w in words if abs(w["top"] - vol_tot_y) < 2.5 and NUM_RE.match(w["text"].strip())
     ]
-    if not numeric_on_total:
-        return {}
-
-    def nearest_val(x_target):
-        if x_target is None or not numeric_on_total:
+    def nearest_val(x):
+        if x is None or not nums_on_vol_total:
             return math.nan
-        w = _nearest_by_x(x_target, numeric_on_total)
+        w = _nearest_by_x(x, nums_on_vol_total)
         return _to_f(w["text"]) if w else math.nan
 
-    out = {
-        "Oil (Mbbl)": nearest_val(x_oil),
-        "Gas (MMcf)": nearest_val(x_gas),
-        "NGL (Mbbl)": nearest_val(x_ngl),
+    oil = nearest_val(x_oil)
+    gas = nearest_val(x_gas)
+    ngl = nearest_val(x_ngl)
+
+    # PV10 (M$) from the P.W., M$ box
+    pv = math.nan
+    page_text = page.extract_text() or ""
+    m = PV_BOX_PAT.search(page_text)
+    if m:
+        pv = _to_f(m.group(1))
+
+    return {
+        "Oil (Mbbl)": oil,
+        "Gas (MMcf)": gas,
+        "NGL (Mbbl)": ngl,
+        "PV10 (M$)": pv,
     }
-    if x_boe is not None:
-        out["Net BOE (Mboe)"] = nearest_val(x_boe)
-    if x_pv is not None:
-        out["PV10 (M$)"] = nearest_val(x_pv)
-
-    # Fallback for PV if header not found: grab last number on TOTAL line (CUM. DISC. FCF)
-    if math.isnan(out.get("PV10 (M$)", math.nan)):
-        # find the last TOTAL match and use its last two numbers; second is PV10 (M$)
-        text = page.extract_text() or ""
-        last_two = None
-        for m in TOTAL_LAST_TWO.finditer(text):
-            last_two = m
-        if last_two:
-            out["PV10 (M$)"] = _to_f(last_two.group(2))
-
-    return out
 
 # ---------- PDF parser ----------
 def parse_pdf_schaper(file_obj) -> tuple[pd.DataFrame | None, str | None]:
@@ -198,7 +212,6 @@ def parse_pdf_schaper(file_obj) -> tuple[pd.DataFrame | None, str | None]:
                 ngl = _to_f(m.group(3))
                 oil = _to_f(m.group(4))
                 boe = _to_f(m.group(5))
-                # m.group(6) = total undiscounted (unused here)
                 pv10_m = _to_f(m.group(7))   # already in M$
                 key = None
                 if "Developed Producing" in label: key = "1PDP"
@@ -222,26 +235,22 @@ def parse_pdf_schaper(file_obj) -> tuple[pd.DataFrame | None, str | None]:
             mcat = RSV_CAT_PAT.search(text)
             if mcat:
                 cat = mcat.group(1)
-                cf_vals = _extract_cashflow_totals_from_page(page)
+                cf = _extract_cashflow_totals_from_page(page)
                 rows.append({
                     "Source": "Cash Flows",
                     "Category": cat,
-                    "Oil (Mbbl)": cf_vals.get("Oil (Mbbl)", math.nan),
-                    "Gas (MMcf)": cf_vals.get("Gas (MMcf)", math.nan),
-                    "NGL (Mbbl)": cf_vals.get("NGL (Mbbl)", math.nan),
-                    "Net BOE (Mboe)": cf_vals.get("Net BOE (Mboe)", math.nan),
-                    "PV10 (M$)": cf_vals.get("PV10 (M$)", math.nan),
+                    "Oil (Mbbl)": cf.get("Oil (Mbbl)", math.nan),
+                    "Gas (MMcf)": cf.get("Gas (MMcf)", math.nan),
+                    "NGL (Mbbl)": cf.get("NGL (Mbbl)", math.nan),
+                    "Net BOE (Mboe)": math.nan,           # not needed/visible on CF pages
+                    "PV10 (M$)": cf.get("PV10 (M$)", math.nan),
                 })
 
-            # --- Oneline (grey category totals + Grand Total) ---
+            # --- Oneline (PDF) grey category totals + Grand Total ---
             for m in ONELINE_CAT_TOTAL_PAT.finditer(text):
                 cat = m.group(1)
-                oil = _to_f(m.group(2))
-                gas = _to_f(m.group(3))
-                ngl = _to_f(m.group(4))
-                boe = _to_f(m.group(5))
-                bfit = _to_f(m.group(6))  # unused, in $
-                npv = _to_f(m.group(7))   # in $; convert to M$
+                oil = _to_f(m.group(2)); gas = _to_f(m.group(3)); ngl = _to_f(m.group(4))
+                boe = _to_f(m.group(5)); npv = _to_f(m.group(7))
                 rows.append({
                     "Source": "Oneline PDF",
                     "Category": cat,
@@ -249,7 +258,7 @@ def parse_pdf_schaper(file_obj) -> tuple[pd.DataFrame | None, str | None]:
                     "Gas (MMcf)": gas,
                     "NGL (Mbbl)": ngl,
                     "Net BOE (Mboe)": boe,
-                    "PV10 (M$)": npv / 1_000.0,
+                    "PV10 (M$)": npv / 1_000.0,      # $ -> M$
                 })
             mgt = ONELINE_GRAND_TOTAL_PAT.search(text)
             if mgt:
@@ -301,7 +310,7 @@ def parse_oneline_xlsx(file):
         "NPV at 10%": "sum",
     }).reset_index()
 
-    g["PV10 (M$)"] = g["NPV at 10%"] / 1_000.0  # dollars -> M$ (thousands)
+    g["PV10 (M$)"] = g["NPV at 10%"] / 1_000.0  # dollars -> M$
     out = []
     for _, r in g.iterrows():
         out.append({
