@@ -1,10 +1,9 @@
 import re
-import io
 import math
 import pandas as pd
 import streamlit as st
 
-# ---------------- PDF parsing deps ----------------
+# ---------- PDF parsing deps ----------
 try:
     import pdfplumber  # type: ignore
     HAS_PDFPLUMBER = True
@@ -12,27 +11,27 @@ except Exception:
     HAS_PDFPLUMBER = False
 
 st.set_page_config(page_title="Reserves Tie-Out Checker", layout="wide")
-st.title("📊 Reserves Tie-Out Checker")
+st.title("📊 Reserves Tie‑Out Checker")
 st.caption(
-    "Cross-check PDF (Table 1.1 / Cash Flows / One-line) vs. Excel (Oneline + Monthly by SE_RSV_CAT). "
-    "Green ✅ / Red ❌ indicate consistency."
+    "Cross‑check PDF (Table 1.1 / Cash Flows / Oneline) and Excel (Oneline + Monthly). "
+    "Green ✅ / Red ❌ indicate consistency. PV reported as PV10 (M$ = thousands of dollars)."
 )
 
-# ---------------- Sidebar ----------------
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("Options")
     abs_tol = st.number_input(
         "Absolute tolerance", min_value=0.0, value=0.5, step=0.1,
-        help="Oil/NGL: Mbbl | Gas: MMcf | BOE: Mboe | PV: $MM"
+        help="Oil/NGL in Mbbl, Gas in MMcf, BOE in Mboe, PV in M$ (thousands of dollars)"
     )
     rel_tol_pct = st.number_input(
-        "Relative tolerance (%)", min_value=0.0, value=0.1, step=0.05,
-        help="Percent difference allowed across sources."
+        "Relative tolerance (%)", min_value=0.0, value=0.10, step=0.05,
+        help="Percent difference allowed across sources"
     )
-    strict = st.checkbox("Strict: every source must have every field", value=False)
-    case_name = st.text_input("Case/Project name", "")
+    strict = st.checkbox("Strict: each metric must appear in every source for a pass", value=False)
+    case_name = st.text_input("Case/Project name (for CSV name)", "")
 
-# ---------------- Helpers ----------------
+# ---------- Helpers ----------
 NUM_RE = re.compile(r"^-?\d[\d,]*\.?\d*$")
 
 def _to_f(val):
@@ -62,27 +61,41 @@ def _norm_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
-# ---------------- Regex patterns (PDF text) ----------------
-RSV_CAT_PAT = re.compile(r"(?i)SE[_\s]*RSV[_\s]*CAT\s*[:=]\s*(1PDP|4PUD|5PROB|6POSS)")
-TABLE11_ROW_PAT = re.compile(
-    r"(?i)(Total\s+Proved\s+Reserves|Proved\s+Developed\s+Producing\s+\(1PDP\)|Proved\s+Undeveloped\s+\(4PUD\)|Total\s+Probable\s+Reserves\s+\(5PROB\)|Total\s+Possible\s+Reserves\s+\(6POSS\)).*?"
-    r"([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+\$\s*([0-9,]+)\s+\$\s*([0-9,]+)"
-)
-ONELINE_TOTAL_PAT = re.compile(
-    r"(?im)^\s*TOTAL\s+(1PDP|4PUD|5PROB|6POSS)\s+([0-9\.,]+)\s+([0-9\.,]+)\s+([0-9\.,]+)\s+([0-9\.,]+)\s+([0-9,]+)\s*$"
-)
-# On cash-flow pages, the last two numbers on the TOTAL line are (Undisc, PV10)
-TOTAL_LAST_TWO = re.compile(r"(?mi)^\s*TOTAL\b[^\n]*?(-?\d[\d,]*\.?\d*)\s+(-?\d[\d,]*\.?\d*)\s*$")
+def _sum_numeric(series: pd.Series) -> float:
+    return pd.to_numeric(series, errors="coerce").sum(skipna=True)
 
+# ---------- Canonical metric names ----------
 METRICS = [
     "Oil (Mbbl)",
     "Gas (MMcf)",
     "NGL (Mbbl)",
     "Net BOE (Mboe)",
-    "PV10 ($MM)",
+    "PV10 (M$)",     # thousands of dollars
 ]
 
-# ---------------- Cash-flow extraction (PDF words with coordinates) ----------------
+# ---------- Regex (PDF) ----------
+# Table 1.1 rows (Gas, NGL, Oil, Mboe, $Undisc, PV10 M$)
+TABLE11_ROW_PAT = re.compile(
+    r"(?i)(Total\s+Proved\s+Reserves|Proved\s+Developed\s+Producing\s+\(1PDP\)|Proved\s+Developed\s+Non-?Producing\s+\(3PDNP\)|Proved\s+Undeveloped\s+\(4PUD\)|Total\s+Probable\s+Reserves\s+\(5PROB\)|Total\s+Possible\s+Reserves\s+\(6POSS\)).*?"
+    r"([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+\$\s*([0-9,]+)\s+\$\s*([0-9,]+)"
+)
+
+# Cash flow page category tag in the top-left
+RSV_CAT_PAT = re.compile(r"(?i)SE[_\s]*RSV[_\s]*CAT\s*=\s*(1PDP|3PDNP|4PUD|5PROB|6POSS)")
+
+# Oneline totals (grey rows) for each category
+ONELINE_CAT_TOTAL_PAT = re.compile(
+    r"(?im)^\s*(1PDP|3PDNP|4PUD|5PROB|6POSS)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,][0-9,]*)\s+([0-9,][0-9,]*)\s*$"
+)
+# Oneline grand total row
+ONELINE_GRAND_TOTAL_PAT = re.compile(
+    r"(?im)^\s*Grand\s+Total\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,][0-9,]*)\s+([0-9,][0-9,]*)\s*$"
+)
+
+# TOTAL line (fallback for PV if needed)
+TOTAL_LAST_TWO = re.compile(r"(?mi)^\s*TOTAL\b[^\n]*?(-?\d[\d,]*\.?\d*)\s+(-?\d[\d,]*\.?\d*)\s*$")
+
+# ---------- Cash‑flow helpers ----------
 def _nearest_by_x(target_x, numeric_words):
     best, best_d = None, 1e9
     for w in numeric_words:
@@ -94,9 +107,9 @@ def _nearest_by_x(target_x, numeric_words):
 
 def _extract_cashflow_totals_from_page(page) -> dict:
     """
-    Use pdfplumber word positions to map the TOTAL row values to the headers
-    'NET OIL PROD', 'NET GAS PROD', 'NET NGL PROD' (BOE only if 'NET EQUIV' exists).
-    Returns a dict with Oil/Gas/NGL and optional Net BOE.
+    Align TOTAL row numbers to column headers for:
+      NET OIL PROD, NET GAS PROD, NET NGL PROD (and optionally NET EQUIV).
+    Also tries to pick PV10 (M$) from the CUM. DISC. FCF/CM. DISC. FCF column family when possible.
     """
     words = page.extract_words(
         use_text_flow=True, keep_blank_chars=False, extra_attrs=["x0", "x1", "top", "bottom"]
@@ -104,28 +117,35 @@ def _extract_cashflow_totals_from_page(page) -> dict:
     if not words:
         return {}
 
-    # Locate TOTAL row (last one on the page)
+    # Locate the TOTAL row (last "TOTAL" on the page)
     total_words = [w for w in words if w["text"].strip().upper() == "TOTAL"]
     if not total_words:
         return {}
     tot_word = max(total_words, key=lambda w: w["top"])
     tot_y = tot_word["top"]
 
-    # Headers above totals
+    # Headers above TOTAL
     headers = [w for w in words if w["top"] < tot_y - 5]
 
-    def find_header_x(label):
-        lbl = label.upper()
-        matches = [w for w in headers if w["text"].strip().upper() == lbl]
-        if not matches:
-            return None
-        h = min(matches, key=lambda w: w["top"])  # choose first (topmost)
-        return (h["x0"] + h["x1"]) / 2.0
+    def find_header_x(candidates):
+        for cand in candidates:
+            lbl = cand.upper()
+            matches = [w for w in headers if w["text"].strip().upper() == lbl]
+            if matches:
+                h = min(matches, key=lambda w: w["top"])
+                return (h["x0"] + h["x1"]) / 2.0
+        return None
 
-    x_oil = find_header_x("NET OIL PROD")
-    x_gas = find_header_x("NET GAS PROD")
-    x_ngl = find_header_x("NET NGL PROD")
-    x_boe = find_header_x("NET EQUIV")  # optional (only if present)
+    x_oil = find_header_x(["NET OIL PROD", "NET OIL"])
+    x_gas = find_header_x(["NET GAS PROD", "NET GAS"])
+    x_ngl = find_header_x(["NET NGL PROD", "NET NGL"])
+    x_boe = find_header_x(["NET EQUIV", "NET EQUI"])  # optional
+
+    # PV: try the column family "CUM. DISC. FCF"/"CM. DISC. FCF"
+    x_pv = find_header_x([
+        "CUM. DISC. FCF", "CUM. DISC. FCF.", "CM. DISC. FCF", "CUM DISC FCF",
+        "CUM. DISC.", "DISC. FCF"
+    ])
 
     numeric_on_total = [
         w for w in words if abs(w["top"] - tot_y) < 3 and NUM_RE.match(w["text"].strip())
@@ -146,11 +166,23 @@ def _extract_cashflow_totals_from_page(page) -> dict:
     }
     if x_boe is not None:
         out["Net BOE (Mboe)"] = nearest_val(x_boe)
+    if x_pv is not None:
+        out["PV10 (M$)"] = nearest_val(x_pv)
+
+    # Fallback for PV if header not found: grab last number on TOTAL line (CUM. DISC. FCF)
+    if math.isnan(out.get("PV10 (M$)", math.nan)):
+        # find the last TOTAL match and use its last two numbers; second is PV10 (M$)
+        text = page.extract_text() or ""
+        last_two = None
+        for m in TOTAL_LAST_TWO.finditer(text):
+            last_two = m
+        if last_two:
+            out["PV10 (M$)"] = _to_f(last_two.group(2))
+
     return out
 
-# ---------------- PDF parser ----------------
-def parse_pdf_schaper(file_obj):
-    """Parse PDF into rows of [Source, Category, metrics...]."""
+# ---------- PDF parser ----------
+def parse_pdf_schaper(file_obj) -> tuple[pd.DataFrame | None, str | None]:
     if not HAS_PDFPLUMBER:
         return None, "pdfplumber is not installed"
 
@@ -159,95 +191,93 @@ def parse_pdf_schaper(file_obj):
         for page in pdf.pages:
             text = page.extract_text() or ""
 
-            # Table 1.1 on any page
+            # --- Table 1.1 rows ---
             for m in TABLE11_ROW_PAT.finditer(text):
                 label = m.group(1)
-                gas = _to_f(m.group(2))     # MMcf
-                ngl = _to_f(m.group(3))     # Mbbl
-                oil = _to_f(m.group(4))     # Mbbl
-                boe = _to_f(m.group(5))     # Mboe
-                pv10 = _to_f(m.group(7))    # $MM
-
+                gas = _to_f(m.group(2))
+                ngl = _to_f(m.group(3))
+                oil = _to_f(m.group(4))
+                boe = _to_f(m.group(5))
+                # m.group(6) = total undiscounted (unused here)
+                pv10_m = _to_f(m.group(7))   # already in M$
                 key = None
-                if "Developed" in label: key = "1PDP"
+                if "Developed Producing" in label: key = "1PDP"
+                elif "Non-Prod" in label or "NonProducing" in label or "3PDNP" in label: key = "3PDNP"
                 elif "Undeveloped" in label: key = "4PUD"
                 elif "Probable" in label: key = "5PROB"
                 elif "Possible" in label: key = "6POSS"
                 elif "Total Proved Reserves" in label: key = "TOTAL PROVED"
                 if key:
-                    rows.append(
-                        {
-                            "Source": "Table1.1",
-                            "Category": key,
-                            "Oil (Mbbl)": oil,
-                            "Gas (MMcf)": gas,
-                            "NGL (Mbbl)": ngl,
-                            "Net BOE (Mboe)": boe,
-                            "PV10 ($MM)": pv10,
-                        }
-                    )
-
-            # Cash-flow page
-            mcat = RSV_CAT_PAT.search(text)
-            if mcat:
-                cat = mcat.group(1)
-                # PV10 from last two numbers on TOTAL line (second is PV10)
-                pv10_cf = math.nan
-                last_two = None
-                for m in TOTAL_LAST_TWO.finditer(text):
-                    last_two = m
-                if last_two:
-                    pv10_cf = _to_f(last_two.group(2))
-                # Volumes aligned by headers
-                cf_vals = _extract_cashflow_totals_from_page(page)
-                rows.append(
-                    {
-                        "Source": "Cash Flows",
-                        "Category": cat,
-                        "Oil (Mbbl)": cf_vals.get("Oil (Mbbl)", math.nan),
-                        "Gas (MMcf)": cf_vals.get("Gas (MMcf)", math.nan),
-                        "NGL (Mbbl)": cf_vals.get("NGL (Mbbl)", math.nan),
-                        "Net BOE (Mboe)": cf_vals.get("Net BOE (Mboe)", math.nan),
-                        "PV10 ($MM)": pv10_cf,
-                    }
-                )
-
-            # One-line summary totals
-            for m in ONELINE_TOTAL_PAT.finditer(text):
-                key = m.group(1)
-                oil = _to_f(m.group(2))
-                gas = _to_f(m.group(3))
-                ngl = _to_f(m.group(4))
-                boe = _to_f(m.group(5))
-                pv10_dollars = _to_f(m.group(6))
-                rows.append(
-                    {
-                        "Source": "One-line",
+                    rows.append({
+                        "Source": "Table1.1",
                         "Category": key,
                         "Oil (Mbbl)": oil,
                         "Gas (MMcf)": gas,
                         "NGL (Mbbl)": ngl,
                         "Net BOE (Mboe)": boe,
-                        "PV10 ($MM)": pv10_dollars / 1000.0,
-                    }
-                )
+                        "PV10 (M$)": pv10_m,
+                    })
+
+            # --- Cash‑flow pages keyed by SE_RSV_CAT ---
+            mcat = RSV_CAT_PAT.search(text)
+            if mcat:
+                cat = mcat.group(1)
+                cf_vals = _extract_cashflow_totals_from_page(page)
+                rows.append({
+                    "Source": "Cash Flows",
+                    "Category": cat,
+                    "Oil (Mbbl)": cf_vals.get("Oil (Mbbl)", math.nan),
+                    "Gas (MMcf)": cf_vals.get("Gas (MMcf)", math.nan),
+                    "NGL (Mbbl)": cf_vals.get("NGL (Mbbl)", math.nan),
+                    "Net BOE (Mboe)": cf_vals.get("Net BOE (Mboe)", math.nan),
+                    "PV10 (M$)": cf_vals.get("PV10 (M$)", math.nan),
+                })
+
+            # --- Oneline (grey category totals + Grand Total) ---
+            for m in ONELINE_CAT_TOTAL_PAT.finditer(text):
+                cat = m.group(1)
+                oil = _to_f(m.group(2))
+                gas = _to_f(m.group(3))
+                ngl = _to_f(m.group(4))
+                boe = _to_f(m.group(5))
+                bfit = _to_f(m.group(6))  # unused, in $
+                npv = _to_f(m.group(7))   # in $; convert to M$
+                rows.append({
+                    "Source": "Oneline PDF",
+                    "Category": cat,
+                    "Oil (Mbbl)": oil,
+                    "Gas (MMcf)": gas,
+                    "NGL (Mbbl)": ngl,
+                    "Net BOE (Mboe)": boe,
+                    "PV10 (M$)": npv / 1_000.0,
+                })
+            mgt = ONELINE_GRAND_TOTAL_PAT.search(text)
+            if mgt:
+                oil = _to_f(mgt.group(1)); gas = _to_f(mgt.group(2)); ngl = _to_f(mgt.group(3))
+                boe = _to_f(mgt.group(4)); npv = _to_f(mgt.group(6))
+                rows.append({
+                    "Source": "Oneline PDF",
+                    "Category": "TOTAL PROVED",
+                    "Oil (Mbbl)": oil,
+                    "Gas (MMcf)": gas,
+                    "NGL (Mbbl)": ngl,
+                    "Net BOE (Mboe)": boe,
+                    "PV10 (M$)": npv / 1_000.0,
+                })
 
     if not rows:
         return None, "No recognizable sections found."
     return pd.DataFrame(rows), None
 
-# ---------------- Excel: Oneline parser (exact columns) ----------------
+# ---------- Excel: Oneline (exact headers) ----------
 def parse_oneline_xlsx(file):
     """
-    Parse Oneline XLS with explicit columns:
-    SE_RSV_CAT, Net Res Oil (Mbbl), Net Res Gas (MMcf), Net Res NGL (Mbbl),
-    Net Res (MBOE), NPV at 10%.
-    Group by SE_RSV_CAT and sum volumes/NPV.
+    Columns (exact): SE_RSV_CAT, Net Res Oil (Mbbl), Net Res Gas (MMcf),
+    Net Res NGL (Mbbl), Net Res (MBOE), NPV at 10%  (in $).
     """
     df = pd.read_excel(file)
     df = _norm_columns(df)
-
-    required_cols = [
+    required = [
         "SE_RSV_CAT",
         "Net Res Oil (Mbbl)",
         "Net Res Gas (MMcf)",
@@ -255,16 +285,15 @@ def parse_oneline_xlsx(file):
         "Net Res (MBOE)",
         "NPV at 10%",
     ]
-    missing = [c for c in required_cols if c not in df.columns]
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        st.error(f"Oneline XLS missing expected columns: {missing}")
-        return pd.DataFrame(columns=["Source","Category"]+METRICS)
+        st.error(f"Oneline XLS missing columns: {missing}")
+        return pd.DataFrame(columns=["Source", "Category"] + METRICS)
 
-    # Clean numeric columns
-    for c in required_cols[1:]:
-        df[c] = pd.to_numeric(df[c].replace("[\\$,]", "", regex=True), errors="coerce")
+    for c in required[1:]:
+        df[c] = pd.to_numeric(df[c].replace(r"[\$,]", "", regex=True), errors="coerce")
 
-    grouped = df.groupby("SE_RSV_CAT").agg({
+    g = df.groupby("SE_RSV_CAT").agg({
         "Net Res Oil (Mbbl)": "sum",
         "Net Res Gas (MMcf)": "sum",
         "Net Res NGL (Mbbl)": "sum",
@@ -272,106 +301,67 @@ def parse_oneline_xlsx(file):
         "NPV at 10%": "sum",
     }).reset_index()
 
-    # Normalize PV10 to $MM
-    grouped["PV10 ($MM)"] = grouped["NPV at 10%"] / 1_000_000.0
-
-    frames = []
-    for _, r in grouped.iterrows():
-        frames.append({
+    g["PV10 (M$)"] = g["NPV at 10%"] / 1_000.0  # dollars -> M$ (thousands)
+    out = []
+    for _, r in g.iterrows():
+        out.append({
             "Source": "Oneline XLS",
             "Category": str(r["SE_RSV_CAT"]).strip(),
             "Oil (Mbbl)": r["Net Res Oil (Mbbl)"],
             "Gas (MMcf)": r["Net Res Gas (MMcf)"],
             "NGL (Mbbl)": r["Net Res NGL (Mbbl)"],
             "Net BOE (Mboe)": r["Net Res (MBOE)"],
-            "PV10 ($MM)": r["PV10 ($MM)"],
+            "PV10 (M$)": r["PV10 (M$)"],
         })
-    return pd.DataFrame(frames)
+    return pd.DataFrame(out, columns=["Source", "Category"] + METRICS)
 
-# ---------------- Excel: Monthly parser (tight headers) ----------------
+# ---------- Excel: Monthly (tight headers) ----------
 def parse_monthly_xlsx(file):
     """
-    Expect rows with:
-      SE_RSV_CAT, Net Oil Prod, Net Gas Prod, Net NGL Prod
-    (case-insensitive). We sum by category. PV10 not expected here.
+    Expect: SE_RSV_CAT, Net Oil Prod, Net Gas Prod, Net NGL Prod.
+    Sums to category totals. PV not present.
     """
-    # Read all sheets into a dict
-    x = pd.read_excel(file, sheet_name=None)
+    all_sheets = pd.read_excel(file, sheet_name=None)
     frames = []
-
-    for sheet_name, df in x.items():
+    for _, df in (all_sheets or {}).items():
         if df is None or df.empty:
             continue
         df = _norm_columns(df)
+        map_lower = {c.lower(): c for c in df.columns}
+        def col(name): return map_lower.get(name.lower())
 
-        # Case-insensitive exact names
-        cols_lower = {c.lower(): c for c in df.columns}
-        def get_col(name_ci):
-            return cols_lower.get(name_ci.lower())
+        cat = col("SE_RSV_CAT") or col("se_rsv_cat")
+        oil = col("Net Oil Prod")
+        gas = col("Net Gas Prod")
+        ngl = col("Net NGL Prod")
+        boe = col("Net BOE") or col("Net Equiv")
 
-        cat_col = get_col("SE_RSV_CAT") or get_col("se_rsv_cat")
-        oil_col = get_col("Net Oil Prod")
-        gas_col = get_col("Net Gas Prod")
-        ngl_col = get_col("Net NGL Prod")
-        boe_col = get_col("Net BOE") or get_col("Net Equiv")  # optional
-
-        if not cat_col or not (oil_col and gas_col and ngl_col):
-            # Try flexible match if exact not found
-            def find_like(pat):
-                r = re.compile(pat, re.I)
-                for c in df.columns:
-                    if r.fullmatch(str(c).strip()):
-                        return c
-                for c in df.columns:
-                    if r.search(str(c)):
-                        return c
-                return None
-            cat_col = cat_col or find_like(r"SE[_\s-]*RSV[_\s-]*CAT")
-            oil_col = oil_col or find_like(r"Net\s*Oil\s*Prod")
-            gas_col = gas_col or find_like(r"Net\s*Gas\s*Prod")
-            ngl_col = ngl_col or find_like(r"Net\s*NGL\s*Prod")
-            boe_col = boe_col or find_like(r"Net\s*(BOE|Equiv)")
-
-        if not cat_col or not (oil_col and gas_col and ngl_col):
-            # not a sheet we care about
+        if not (cat and oil and gas and ngl):
             continue
 
-        # Coerce numeric
-        for c in [oil_col, gas_col, ngl_col, boe_col]:
+        for c in [oil, gas, ngl, boe]:
             if c in df:
-                df[c] = pd.to_numeric(df[c].replace("[\\$,]", "", regex=True), errors="coerce")
+                df[c] = pd.to_numeric(df[c].replace(r"[\$,]", "", regex=True), errors="coerce")
 
-        key = df[cat_col].astype(str).str.strip()
-        slim_cols = [c for c in [oil_col, gas_col, ngl_col, boe_col] if c]
-        grouped = df[slim_cols].groupby(key).agg(_sum_numeric)
-        grouped.index.name = "Category"
-        grouped = grouped.reset_index()
+        slim = df[[c for c in [oil, gas, ngl, boe] if c]].copy()
+        grouped = slim.groupby(df[cat].astype(str).str.strip()).agg(_sum_numeric).reset_index()
+        grouped = grouped.rename(columns={
+            "index": "Category",
+            oil: "Oil (Mbbl)",
+            gas: "Gas (MMcf)",
+            ngl: "NGL (Mbbl)",
+            boe: "Net BOE (Mboe)",
+        })
+        grouped.rename(columns={grouped.columns[0]: "Category"}, inplace=True)
+        grouped["Source"] = "Monthly XLS"
+        grouped["PV10 (M$)"] = math.nan
+        frames.append(grouped[["Source", "Category"] + METRICS])
 
-        rename = {}
-        rename[oil_col] = "Oil (Mbbl)"
-        rename[gas_col] = "Gas (MMcf)"
-        rename[ngl_col] = "NGL (Mbbl)"
-        if boe_col: rename[boe_col] = "Net BOE (Mboe)"
-        grouped = grouped.rename(columns=rename)
+    if frames:
+        return pd.concat(frames, ignore_index=True)
+    return pd.DataFrame(columns=["Source", "Category"] + METRICS)
 
-        keep_cols = ["Category", "Oil (Mbbl)", "Gas (MMcf)", "NGL (Mbbl)", "Net BOE (Mboe)"]
-        grouped = grouped.reindex(columns=keep_cols)
-
-        for _, r in grouped.iterrows():
-            frames.append({
-                "Source": "Monthly XLS",
-                "Category": r.get("Category"),
-                "Oil (Mbbl)": r.get("Oil (Mbbl)", math.nan),
-                "Gas (MMcf)": r.get("Gas (MMcf)", math.nan),
-                "NGL (Mbbl)": r.get("NGL (Mbbl)", math.nan),
-                "Net BOE (Mboe)": r.get("Net BOE (Mboe)", math.nan),
-                "PV10 ($MM)": math.nan,
-            })
-
-    cols = ["Source", "Category"] + METRICS
-    return pd.DataFrame(frames, columns=cols) if frames else pd.DataFrame(columns=cols)
-
-# ---------------- Consistency table ----------------
+# ---------- Consistency checks ----------
 def check_consistency(df: pd.DataFrame) -> pd.DataFrame:
     out = []
     for cat in sorted(df["Category"].unique()):
@@ -381,27 +371,23 @@ def check_consistency(df: pd.DataFrame) -> pd.DataFrame:
                 ok = False
             else:
                 ok = within_tolerance(vals, abs_tol, rel_tol_pct) if vals else False
-            status = "✅" if ok else "❌"
-            out.append(
-                {
-                    "Category": cat,
-                    "Metric": metric,
-                    "Sources": int(df.loc[(df["Category"] == cat) & df[metric].notna()].shape[0]),
-                    "Min": pd.Series(vals).min() if vals else math.nan,
-                    "Max": pd.Series(vals).max() if vals else math.nan,
-                    "Consistent?": status,
-                }
-            )
+            out.append({
+                "Category": cat,
+                "Metric": metric,
+                "Sources": int(df.loc[(df["Category"] == cat) & df[metric].notna()].shape[0]),
+                "Min": pd.Series(vals).min() if vals else math.nan,
+                "Max": pd.Series(vals).max() if vals else math.nan,
+                "Consistent?": "✅" if ok else "❌",
+            })
     return pd.DataFrame(out)
 
-# ---------------- UI ----------------
-left, right = st.columns(2)
-with left:
-    pdf_files = st.file_uploader("Upload **PDF** report(s)", type=["pdf"], accept_multiple_files=True)
-with right:
-    oneline_xls = st.file_uploader("Upload **Oneline XLSX**", type=["xls", "xlsx"], accept_multiple_files=False)
-
-monthly_xls = st.file_uploader("Upload **Monthly XLSX**", type=["xls", "xlsx"], accept_multiple_files=False, key="monthly")
+# ---------- UI ----------
+lcol, rcol = st.columns(2)
+with lcol:
+    pdf_files = st.file_uploader("Upload PDF report(s)", type=["pdf"], accept_multiple_files=True)
+with rcol:
+    oneline_xls = st.file_uploader("Upload Oneline XLS/XLSX", type=["xls", "xlsx"], accept_multiple_files=False)
+monthly_xls = st.file_uploader("Upload Monthly XLS/XLSX", type=["xls", "xlsx"], key="monthly", accept_multiple_files=False)
 
 frames = []
 
@@ -442,12 +428,12 @@ if monthly_xls:
         except Exception as e:
             st.error(f"Monthly XLS parse error: {e}")
 
-# ---------------- Output ----------------
+# ---------- Output ----------
 if frames:
     merged = pd.concat(frames, ignore_index=True)
 
     st.subheader("Extracted figures (all sources)")
-    st.dataframe(merged)
+    st.dataframe(merged, use_container_width=True)
 
     st.subheader("Consistency checks (by file)")
     results = (
@@ -456,14 +442,14 @@ if frames:
         .reset_index(level=0)
         .rename(columns={"level_0": "File"})
     )
-    st.dataframe(results)
+    st.dataframe(results, use_container_width=True)
 
     st.subheader("Overall")
     overall = []
     for file, group in results.groupby("File"):
         ok = group["Consistent?"].eq("✅").all()
         overall.append({"File": file, "Pass?": "✅" if ok else "❌"})
-    st.dataframe(pd.DataFrame(overall))
+    st.dataframe(pd.DataFrame(overall), use_container_width=True)
 
     st.download_button(
         "Download detailed CSV",
