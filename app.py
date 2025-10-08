@@ -14,7 +14,7 @@ st.set_page_config(page_title="Reserves Tie-Out Checker", layout="wide")
 st.title("📊 Reserves Tie‑Out Checker")
 st.caption(
     "Cross‑check PDF (Table 1.1 / Cash Flows / Oneline) and Excel (Oneline + Monthly). "
-    "Green ✅ / Red ❌ indicate consistency. PV reported as PV10 (M$ = thousands of dollars)."
+    "Green ✅ / Red ❌ indicate consistency. PV shown as PV9 / PV10 (M$ = thousands of dollars)."
 )
 
 # ---------- Sidebar ----------
@@ -33,7 +33,7 @@ with st.sidebar:
 
 # ---------- Helpers ----------
 NUM_RE = re.compile(r"^-?\d[\d,]*\.?\d*$")
-PV_BOX_PAT = re.compile(r"(?i)P\.W\.,\s*M\$\s*([0-9][\d,\.\s]*)")
+PV_BOX_PAT = re.compile(r"(?i)P\.W\.,\s*M\$")
 
 def _to_f(val):
     """String/number -> float with commas/$ stripped."""
@@ -65,26 +65,31 @@ def _norm_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _sum_numeric(series: pd.Series) -> float:
     return pd.to_numeric(series, errors="coerce").sum(skipna=True)
 
+def _slug(s: str) -> str:
+    """Make a forgiving, comparable version of a column name."""
+    s = (s or "").replace("\xa0", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    s = s.replace("@", "at")
+    s = s.replace("mmbbls", "mbbl").replace("mbbls", "mbbl")
+    s = s.replace("mmcf", "mmcf").replace("mboe", "mboe")
+    return s
+
 # ---------- Canonical metric names ----------
 METRICS = [
     "Oil (Mbbl)",
     "Gas (MMcf)",
     "NGL (Mbbl)",
     "Net BOE (Mboe)",
+    "PV9 (M$)",      # thousands of dollars
     "PV10 (M$)",     # thousands of dollars
 ]
 
 # ---------- Regex (PDF) ----------
-# Table 1.1 rows (Gas, NGL, Oil, Mboe, $Undisc, PV10 M$)
 TABLE11_ROW_PAT = re.compile(
     r"(?i)(Total\s+Proved\s+Reserves|Proved\s+Developed\s+Producing\s+\(1PDP\)|Proved\s+Developed\s+Non-?Producing\s+\(3PDNP\)|Proved\s+Undeveloped\s+\(4PUD\)|Total\s+Probable\s+Reserves\s+\(5PROB\)|Total\s+Possible\s+Reserves\s+\(6POSS\)).*?"
     r"([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+\$\s*([0-9,]+)\s+\$\s*([0-9,]+)"
 )
-
-# Cash flow page category tag in the top-left
 RSV_CAT_PAT = re.compile(r"(?i)SE[_\s]*RSV[_\s]*CAT\s*=\s*(1PDP|3PDNP|4PUD|5PROB|6POSS)")
-
-# Oneline (PDF) category totals and grand total
 ONELINE_CAT_TOTAL_PAT = re.compile(
     r"(?im)^\s*(1PDP|3PDNP|4PUD|5PROB|6POSS)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,][0-9,]*)\s+([0-9,][0-9,]*)\s*$"
 )
@@ -110,13 +115,11 @@ def _find_header_center(words, vol_tot_y, token2):
     U = lambda s: str(s).strip().upper()
     headers = [w for w in words if w["top"] < vol_tot_y - 5]
 
-    # Option A: single token like "NET OIL" (incl. non-breaking space)
     single = [w for w in headers if U(w["text"]) in (f"NET {token2}", f"NET\u00A0{token2}")]
     if single:
         w = min(single, key=lambda t: t["top"])
         return (w["x0"] + w["x1"]) / 2.0
 
-    # Option B: two adjacent tokens on same line: "NET" then "<token2>"
     nets = [w for w in headers if U(w["text"]) == "NET"]
     for n in nets:
         same_line = [w for w in headers if abs(w["top"] - n["top"]) < 2.5 and w["x0"] > n["x0"]]
@@ -126,19 +129,17 @@ def _find_header_center(words, vol_tot_y, token2):
             x0 = min(n["x0"], w["x0"]); x1 = max(n["x1"], w["x1"])
             return (x0 + x1) / 2.0
 
-    # Option C: fallback—use the "<token2>" token position alone
     tokens = [w for w in headers if U(w["text"]) == token2]
     if tokens:
         w = min(tokens, key=lambda t: t["top"])
         return (w["x0"] + w["x1"]) / 2.0
-
     return None
 
 def _extract_cashflow_totals_from_page(page) -> dict:
     """
-    Extract from a cash-flow page:
+    Extract from a CF page:
       • NET OIL / NET GAS / NET NGL totals from the *upper* table's TOTAL row
-      • PV10 (M$) from the P.W., M$ box at bottom
+      • PV9 & PV10 (M$) from the P.W., M$ box at bottom
     """
     words = page.extract_words(
         use_text_flow=True, keep_blank_chars=False, extra_attrs=["x0", "x1", "top", "bottom"]
@@ -146,7 +147,7 @@ def _extract_cashflow_totals_from_page(page) -> dict:
     if not words:
         return {}
 
-    # Find the economics header line ("CUM. DISC. FCF"), which marks the lower table.
+    # Assemble lines to find the economics header ("CUM. DISC. FCF")
     by_line = {}
     for w in words:
         y = round(w["top"], 1)
@@ -164,7 +165,7 @@ def _extract_cashflow_totals_from_page(page) -> dict:
             econ_hdr_y = y
             break
 
-    # Choose the volumes TOTAL: the last "TOTAL" above the economics header.
+    # Volumes TOTAL: last TOTAL above economics header
     totals = [w for w in words if w["text"].strip().upper() == "TOTAL"]
     if not totals:
         return {}
@@ -174,18 +175,17 @@ def _extract_cashflow_totals_from_page(page) -> dict:
         if above:
             vol_tot_y = max(above, key=lambda w: w["top"])["top"]
     if vol_tot_y is None:
-        vol_tot_y = min(totals, key=lambda w: w["top"])["top"]  # cautious fallback
+        vol_tot_y = min(totals, key=lambda w: w["top"])["top"]  # fallback
 
     # Header centers
     x_oil = _find_header_center(words, vol_tot_y, "OIL")
     x_gas = _find_header_center(words, vol_tot_y, "GAS")
     x_ngl = _find_header_center(words, vol_tot_y, "NGL")
 
-    # Numeric words on the volumes TOTAL line
+    # Numbers on the volumes TOTAL line
     nums_on_total = [
         w for w in words if abs(w["top"] - vol_tot_y) < 2.5 and NUM_RE.match(w["text"].strip())
     ]
-
     def at_col(xc):
         if xc is None or not nums_on_total:
             return math.nan
@@ -196,14 +196,22 @@ def _extract_cashflow_totals_from_page(page) -> dict:
     gas = at_col(x_gas)
     ngl = at_col(x_ngl)
 
-    # PV10 (M$) from the P.W., M$ box
-    pv = math.nan
+    # PV9 & PV10 from P.W., M$ box
+    pv9 = math.nan
+    pv10 = math.nan
     t = page.extract_text() or ""
     m = PV_BOX_PAT.search(t)
     if m:
-        pv = _to_f(m.group(1))
+        tail = t[m.start():]
+        for rate_str, val_str in re.findall(r"(\d{1,2}\.\d{2})\s+([0-9][\d,]*\.\d+)", tail):
+            r = _to_f(rate_str)
+            v = _to_f(val_str)
+            if abs(r - 9.0) < 0.01:
+                pv9 = v
+            elif abs(r - 10.0) < 0.01:
+                pv10 = v
 
-    return {"Oil (Mbbl)": oil, "Gas (MMcf)": gas, "NGL (Mbbl)": ngl, "PV10 (M$)": pv}
+    return {"Oil (Mbbl)": oil, "Gas (MMcf)": gas, "NGL (Mbbl)": ngl, "PV9 (M$)": pv9, "PV10 (M$)": pv10}
 
 # ---------- PDF parser ----------
 def parse_pdf_schaper(file_obj):
@@ -215,7 +223,7 @@ def parse_pdf_schaper(file_obj):
         for page in pdf.pages:
             text = page.extract_text() or ""
 
-            # --- Table 1.1 rows ---
+            # Table 1.1
             for m in TABLE11_ROW_PAT.finditer(text):
                 label = m.group(1)
                 gas = _to_f(m.group(2))
@@ -238,10 +246,11 @@ def parse_pdf_schaper(file_obj):
                         "Gas (MMcf)": gas,
                         "NGL (Mbbl)": ngl,
                         "Net BOE (Mboe)": boe,
+                        "PV9 (M$)": math.nan,   # Table 1.1 prints PV10 only
                         "PV10 (M$)": pv10_m,
                     })
 
-            # --- Cash‑flow pages keyed by SE_RSV_CAT ---
+            # Cash‑flow pages (volumes totals + PV9/PV10)
             mcat = RSV_CAT_PAT.search(text)
             if mcat:
                 cat = mcat.group(1)
@@ -252,15 +261,16 @@ def parse_pdf_schaper(file_obj):
                     "Oil (Mbbl)": cf.get("Oil (Mbbl)", math.nan),
                     "Gas (MMcf)": cf.get("Gas (MMcf)", math.nan),
                     "NGL (Mbbl)": cf.get("NGL (Mbbl)", math.nan),
-                    "Net BOE (Mboe)": math.nan,           # not needed/visible on CF pages
+                    "Net BOE (Mboe)": math.nan,           # not on CF pages
+                    "PV9 (M$)": cf.get("PV9 (M$)", math.nan),
                     "PV10 (M$)": cf.get("PV10 (M$)", math.nan),
                 })
 
-            # --- Oneline (PDF) grey category totals + Grand Total ---
+            # Oneline (PDF) grey category totals + Grand Total (PV10 only)
             for m in ONELINE_CAT_TOTAL_PAT.finditer(text):
                 cat = m.group(1)
                 oil = _to_f(m.group(2)); gas = _to_f(m.group(3)); ngl = _to_f(m.group(4))
-                boe = _to_f(m.group(5)); npv = _to_f(m.group(7))
+                boe = _to_f(m.group(5)); npv10 = _to_f(m.group(7))
                 rows.append({
                     "Source": "Oneline PDF",
                     "Category": cat,
@@ -268,12 +278,13 @@ def parse_pdf_schaper(file_obj):
                     "Gas (MMcf)": gas,
                     "NGL (Mbbl)": ngl,
                     "Net BOE (Mboe)": boe,
-                    "PV10 (M$)": npv / 1_000.0,      # $ -> M$
+                    "PV9 (M$)": math.nan,
+                    "PV10 (M$)": npv10 / 1_000.0,      # $ -> M$
                 })
             mgt = ONELINE_GRAND_TOTAL_PAT.search(text)
             if mgt:
                 oil = _to_f(mgt.group(1)); gas = _to_f(mgt.group(2)); ngl = _to_f(mgt.group(3))
-                boe = _to_f(mgt.group(4)); npv = _to_f(mgt.group(6))
+                boe = _to_f(mgt.group(4)); npv10 = _to_f(mgt.group(6))
                 rows.append({
                     "Source": "Oneline PDF",
                     "Category": "TOTAL PROVED",
@@ -281,58 +292,100 @@ def parse_pdf_schaper(file_obj):
                     "Gas (MMcf)": gas,
                     "NGL (Mbbl)": ngl,
                     "Net BOE (Mboe)": boe,
-                    "PV10 (M$)": npv / 1_000.0,
+                    "PV9 (M$)": math.nan,
+                    "PV10 (M$)": npv10 / 1_000.0,
                 })
 
     if not rows:
         return None, "No recognizable sections found."
     return pd.DataFrame(rows), None
 
-# ---------- Excel: Oneline (exact headers) ----------
+# ---------- Excel: Oneline (robust headers; all sheets) ----------
+def _pick_col(df: pd.DataFrame, want: str, regexes: list[str]) -> str | None:
+    """Return actual column name in df that best matches `want` slug or regex candidates."""
+    slug_map = {_slug(c): c for c in df.columns}
+    # exact slug
+    if want in slug_map:
+        return slug_map[want]
+    # regex pass over slugs
+    for rx in regexes:
+        pat = re.compile(rx, flags=re.I)
+        for s, orig in slug_map.items():
+            if pat.search(s):
+                return orig
+    return None
+
 def parse_oneline_xlsx(file):
     """
-    Columns (exact): SE_RSV_CAT, Net Res Oil (Mbbl), Net Res Gas (MMcf),
-    Net Res NGL (Mbbl), Net Res (MBOE), NPV at 10%  (in $).
+    Robustly find:
+      SE_RSV_CAT, Net Res Oil (Mbbl), Net Res Gas (MMcf), Net Res NGL (Mbbl),
+      [optional] Net Res (MBOE), NPV at 9%, NPV at 10%.
+    Group & sum by SE_RSV_CAT; convert NPVs ($) -> PV9/PV10 (M$).
     """
-    df = pd.read_excel(file)
-    df = _norm_columns(df)
-    required = [
-        "SE_RSV_CAT",
-        "Net Res Oil (Mbbl)",
-        "Net Res Gas (MMcf)",
-        "Net Res NGL (Mbbl)",
-        "Net Res (MBOE)",
-        "NPV at 10%",
-    ]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        st.error(f"Oneline XLS missing columns: {missing}")
-        return pd.DataFrame(columns=["Source", "Category"] + METRICS)
+    xls = pd.ExcelFile(file)
+    frames = []
 
-    for c in required[1:]:
-        df[c] = pd.to_numeric(df[c].replace(r"[\$,]", "", regex=True), errors="coerce")
+    for sheet in xls.sheet_names:
+        df = pd.read_excel(file, sheet_name=sheet)
+        if df is None or df.empty:
+            continue
+        df = _norm_columns(df)
 
-    g = df.groupby("SE_RSV_CAT").agg({
-        "Net Res Oil (Mbbl)": "sum",
-        "Net Res Gas (MMcf)": "sum",
-        "Net Res NGL (Mbbl)": "sum",
-        "Net Res (MBOE)": "sum",
-        "NPV at 10%": "sum",
-    }).reset_index()
+        # Desired slugs and flexible regexes
+        want_cat  = "se rsv cat"
+        want_oil  = "net res oil (mbbl)"; want_oil_slug = _slug(want_oil)
+        want_gas  = "net res gas (mmcf)"; want_gas_slug = _slug(want_gas)
+        want_ngl  = "net res ngl (mbbl)"; want_ngl_slug = _slug(want_ngl)
+        want_boe  = "net res (mboe)";     want_boe_slug = _slug(want_boe)
+        want_pv9  = "npv at 9%";          want_pv9_slug = _slug(want_pv9)
+        want_pv10 = "npv at 10%";         want_pv10_slug = _slug(want_pv10)
 
-    g["PV10 (M$)"] = g["NPV at 10%"] / 1_000.0  # dollars -> M$
-    out = []
-    for _, r in g.iterrows():
-        out.append({
-            "Source": "Oneline XLS",
-            "Category": str(r["SE_RSV_CAT"]).strip(),
-            "Oil (Mbbl)": r["Net Res Oil (Mbbl)"],
-            "Gas (MMcf)": r["Net Res Gas (MMcf)"],
-            "NGL (Mbbl)": r["Net Res NGL (Mbbl)"],
-            "Net BOE (Mboe)": r["Net Res (MBOE)"],
-            "PV10 (M$)": r["PV10 (M$)"],
-        })
-    return pd.DataFrame(out, columns=["Source", "Category"] + METRICS)
+        cat_col  = _pick_col(df, want_cat,  [r"\bse\s*[_ ]?\s*rsv\s*[_ ]?\s*cat\b"])
+        oil_col  = _pick_col(df, want_oil_slug, [r"net\s*res.*oil.*mbbl"])
+        gas_col  = _pick_col(df, want_gas_slug, [r"net\s*res.*gas.*mmcf"])
+        ngl_col  = _pick_col(df, want_ngl_slug, [r"net\s*res.*ngl.*mbbl"])
+        boe_col  = _pick_col(df, want_boe_slug, [r"net\s*res.*mboe"])
+        pv9_col  = _pick_col(df, want_pv9_slug, [r"(npv|pv).*(9\b|9\s*%)"])
+        pv10_col = _pick_col(df, want_pv10_slug,[r"(npv|pv).*(10\b|10\s*%)"])
+
+        needed = [cat_col, oil_col, gas_col, ngl_col]
+        if not all(needed):
+            # Show a compact warning once per sheet that fails
+            st.warning(
+                f"Oneline XLS: '{sheet}' missing required columns. "
+                f"Found: {list(df.columns)}"
+            )
+            continue
+
+        # Coerce numerics (strip $, commas)
+        for c in [oil_col, gas_col, ngl_col, boe_col, pv9_col, pv10_col]:
+            if c and c in df:
+                df[c] = pd.to_numeric(df[c].replace(r"[\$,]", "", regex=True), errors="coerce")
+
+        # Group & sum by SE_RSV_CAT
+        gcols = {oil_col: "Oil (Mbbl)", gas_col: "Gas (MMcf)", ngl_col: "NGL (Mbbl)"}
+        if boe_col:
+            gcols[boe_col] = "Net BOE (Mboe)"
+        agg = df.groupby(df[cat_col].astype(str).str.strip()).agg({c: "sum" for c in gcols.keys()}).reset_index()
+        agg.rename(columns={agg.columns[0]: "Category", **gcols}, inplace=True)
+        agg["Source"] = "Oneline XLS"
+        # PV9/PV10 (M$)
+        if pv9_col:
+            pv9 = df.groupby(df[cat_col].astype(str).str.strip())[pv9_col].sum().reset_index(drop=True)
+            agg["PV9 (M$)"] = pv9 / 1_000.0
+        else:
+            agg["PV9 (M$)"] = math.nan
+        if pv10_col:
+            pv10 = df.groupby(df[cat_col].astype(str).str.strip())[pv10_col].sum().reset_index(drop=True)
+            agg["PV10 (M$)"] = pv10 / 1_000.0
+        else:
+            agg["PV10 (M$)"] = math.nan
+
+        frames.append(agg[["Source", "Category"] + METRICS])
+
+    if frames:
+        return pd.concat(frames, ignore_index=True)
+    return pd.DataFrame(columns=["Source", "Category"] + METRICS)
 
 # ---------- Excel: Monthly (tight headers) ----------
 def parse_monthly_xlsx(file):
@@ -349,11 +402,11 @@ def parse_monthly_xlsx(file):
         map_lower = {c.lower(): c for c in df.columns}
         def col(name): return map_lower.get(name.lower())
 
-        cat = col("SE_RSV_CAT") or col("se_rsv_cat")
+        cat = col("SE_RSV_CAT") or col("se_rsv_cat") or col("SE RSV CAT")
         oil = col("Net Oil Prod")
         gas = col("Net Gas Prod")
         ngl = col("Net NGL Prod")
-        boe = col("Net BOE") or col("Net Equiv")  # optional
+        boe = col("Net BOE") or col("Net Equiv")
 
         if not (cat and oil and gas and ngl):
             continue
@@ -364,15 +417,12 @@ def parse_monthly_xlsx(file):
 
         slim = df[[c for c in [oil, gas, ngl, boe] if c]].copy()
         grouped = slim.groupby(df[cat].astype(str).str.strip()).agg(_sum_numeric).reset_index()
-        grouped = grouped.rename(columns={
-            "index": "Category",
-            oil: "Oil (Mbbl)",
-            gas: "Gas (MMcf)",
-            ngl: "NGL (Mbbl)",
-            boe: "Net BOE (Mboe)",
-        })
-        grouped.rename(columns={grouped.columns[0]: "Category"}, inplace=True)
+        grouped.rename(columns={
+            grouped.columns[0]: "Category",
+            oil: "Oil (Mbbl)", gas: "Gas (MMcf)", ngl: "NGL (Mbbl)", boe: "Net BOE (Mboe)"
+        }, inplace=True)
         grouped["Source"] = "Monthly XLS"
+        grouped["PV9 (M$)"] = math.nan
         grouped["PV10 (M$)"] = math.nan
         frames.append(grouped[["Source", "Category"] + METRICS])
 
