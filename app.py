@@ -33,6 +33,7 @@ with st.sidebar:
 
 # ---------- Helpers ----------
 NUM_RE = re.compile(r"^-?\d[\d,]*\.?\d*$")
+PV_BOX_PAT = re.compile(r"(?i)P\.W\.,\s*M\$\s*([0-9][\d,\.\s]*)")
 
 def _to_f(val):
     """String/number -> float with commas/$ stripped."""
@@ -91,9 +92,6 @@ ONELINE_GRAND_TOTAL_PAT = re.compile(
     r"(?im)^\s*Grand\s+Total\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,][0-9,]*)\s+([0-9,][0-9,]*)\s*$"
 )
 
-# PV10 on each CF page (bottom right box)
-PV_BOX_PAT = re.compile(r"(?i)P\.W\.,\s*M\$\s*([0-9][\d,\.\s]*)")
-
 # ---------- Cash‑flow helpers ----------
 def _nearest_by_x(target_x, numeric_words):
     best, best_d = None, 1e9
@@ -104,11 +102,43 @@ def _nearest_by_x(target_x, numeric_words):
             best, best_d = w, d
     return best
 
+def _find_header_center(words, vol_tot_y, token2):
+    """
+    Return the x-center of the header column for NET <token2> (token2 in {'OIL','GAS','NGL'}).
+    Works whether headers are split as NET / OIL / PROD or joined as 'NET OIL'.
+    """
+    U = lambda s: str(s).strip().upper()
+    headers = [w for w in words if w["top"] < vol_tot_y - 5]
+
+    # Option A: single token like "NET OIL" (incl. non-breaking space)
+    single = [w for w in headers if U(w["text"]) in (f"NET {token2}", f"NET\u00A0{token2}")]
+    if single:
+        w = min(single, key=lambda t: t["top"])
+        return (w["x0"] + w["x1"]) / 2.0
+
+    # Option B: two adjacent tokens on same line: "NET" then "<token2>"
+    nets = [w for w in headers if U(w["text"]) == "NET"]
+    for n in nets:
+        same_line = [w for w in headers if abs(w["top"] - n["top"]) < 2.5 and w["x0"] > n["x0"]]
+        t2 = [w for w in same_line if U(w["text"]) == token2]
+        if t2:
+            w = t2[0]
+            x0 = min(n["x0"], w["x0"]); x1 = max(n["x1"], w["x1"])
+            return (x0 + x1) / 2.0
+
+    # Option C: fallback—use the "<token2>" token position alone
+    tokens = [w for w in headers if U(w["text"]) == token2]
+    if tokens:
+        w = min(tokens, key=lambda t: t["top"])
+        return (w["x0"] + w["x1"]) / 2.0
+
+    return None
+
 def _extract_cashflow_totals_from_page(page) -> dict:
     """
-    Robustly extract from CF page:
-      • Net Oil/Gas/NGL totals from the *volumes* TOTAL row (upper table)
-      • PV10 (M$) from the P.W., M$ box (bottom)
+    Extract from a cash-flow page:
+      • NET OIL / NET GAS / NET NGL totals from the *upper* table's TOTAL row
+      • PV10 (M$) from the P.W., M$ box at bottom
     """
     words = page.extract_words(
         use_text_flow=True, keep_blank_chars=False, extra_attrs=["x0", "x1", "top", "bottom"]
@@ -116,7 +146,7 @@ def _extract_cashflow_totals_from_page(page) -> dict:
     if not words:
         return {}
 
-    # Build lines to detect the economics header (CUM. DISC. FCF)
+    # Find the economics header line ("CUM. DISC. FCF"), which marks the lower table.
     by_line = {}
     for w in words:
         y = round(w["top"], 1)
@@ -134,69 +164,49 @@ def _extract_cashflow_totals_from_page(page) -> dict:
             econ_hdr_y = y
             break
 
-    # TOTAL candidates
-    total_ws = [w for w in words if w["text"].strip().upper() == "TOTAL"]
-    if not total_ws:
+    # Choose the volumes TOTAL: the last "TOTAL" above the economics header.
+    totals = [w for w in words if w["text"].strip().upper() == "TOTAL"]
+    if not totals:
         return {}
-
-    # Volumes TOTAL: last TOTAL before the economics header
     vol_tot_y = None
     if econ_hdr_y is not None:
-        before = [w for w in total_ws if w["top"] < econ_hdr_y - 1]
-        if before:
-            vol_tot_y = max(before, key=lambda w: w["top"])["top"]
+        above = [w for w in totals if w["top"] < econ_hdr_y - 1]
+        if above:
+            vol_tot_y = max(above, key=lambda w: w["top"])["top"]
     if vol_tot_y is None:
-        # Fallback: the first TOTAL on the page is usually the volumes TOTAL
-        vol_tot_y = min(total_ws, key=lambda w: w["top"])["top"]
+        vol_tot_y = min(totals, key=lambda w: w["top"])["top"]  # cautious fallback
 
-    # Header centers for NET OIL / NET GAS / NET NGL (no longer require 'PROD')
-    header_candidates = [w for w in words if w["top"] < vol_tot_y - 5]
-    header_candidates.sort(key=lambda w: (w["top"], w["x0"]))
+    # Header centers
+    x_oil = _find_header_center(words, vol_tot_y, "OIL")
+    x_gas = _find_header_center(words, vol_tot_y, "GAS")
+    x_ngl = _find_header_center(words, vol_tot_y, "NGL")
 
-    def center_for_pair(second_token):
-        for i in range(len(header_candidates) - 1):
-            a = header_candidates[i]["text"].strip().upper()
-            b = header_candidates[i + 1]["text"].strip().upper()
-            if a == "NET" and b == second_token:
-                x0 = min(header_candidates[i]["x0"], header_candidates[i + 1]["x0"])
-                x1 = max(header_candidates[i]["x1"], header_candidates[i + 1]["x1"])
-                return (x0 + x1) / 2.0
-        return None
-
-    x_oil = center_for_pair("OIL")
-    x_gas = center_for_pair("GAS")
-    x_ngl = center_for_pair("NGL")
-
-    # Numbers on the volumes TOTAL line
-    nums_on_vol_total = [
+    # Numeric words on the volumes TOTAL line
+    nums_on_total = [
         w for w in words if abs(w["top"] - vol_tot_y) < 2.5 and NUM_RE.match(w["text"].strip())
     ]
-    def nearest_val(x):
-        if x is None or not nums_on_vol_total:
+
+    def at_col(xc):
+        if xc is None or not nums_on_total:
             return math.nan
-        w = _nearest_by_x(x, nums_on_vol_total)
+        w = _nearest_by_x(xc, nums_on_total)
         return _to_f(w["text"]) if w else math.nan
 
-    oil = nearest_val(x_oil)
-    gas = nearest_val(x_gas)
-    ngl = nearest_val(x_ngl)
+    oil = at_col(x_oil)
+    gas = at_col(x_gas)
+    ngl = at_col(x_ngl)
 
     # PV10 (M$) from the P.W., M$ box
     pv = math.nan
-    page_text = page.extract_text() or ""
-    m = PV_BOX_PAT.search(page_text)
+    t = page.extract_text() or ""
+    m = PV_BOX_PAT.search(t)
     if m:
         pv = _to_f(m.group(1))
 
-    return {
-        "Oil (Mbbl)": oil,
-        "Gas (MMcf)": gas,
-        "NGL (Mbbl)": ngl,
-        "PV10 (M$)": pv,
-    }
+    return {"Oil (Mbbl)": oil, "Gas (MMcf)": gas, "NGL (Mbbl)": ngl, "PV10 (M$)": pv}
 
 # ---------- PDF parser ----------
-def parse_pdf_schaper(file_obj) -> tuple[pd.DataFrame | None, str | None]:
+def parse_pdf_schaper(file_obj):
     if not HAS_PDFPLUMBER:
         return None, "pdfplumber is not installed"
 
@@ -343,7 +353,7 @@ def parse_monthly_xlsx(file):
         oil = col("Net Oil Prod")
         gas = col("Net Gas Prod")
         ngl = col("Net NGL Prod")
-        boe = col("Net BOE") or col("Net Equiv")
+        boe = col("Net BOE") or col("Net Equiv")  # optional
 
         if not (cat and oil and gas and ngl):
             continue
